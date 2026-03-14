@@ -1,5 +1,6 @@
 import cv2
 import mediapipe as mp
+import math
 import time
 
 from mediapipe.tasks import python
@@ -17,6 +18,36 @@ HAND_CONNECTIONS = [
 
 # Store latest result from async callback
 latest_result = None
+
+
+def is_finger_up(lm, tip_id, base_id):
+    return lm[tip_id].y < lm[base_id].y
+
+
+def dist(lm, a, b, w, h):
+    return math.hypot(
+        (lm[a].x - lm[b].x) * w,
+        (lm[a].y - lm[b].y) * h,
+    )
+
+
+def classify(lm, w, h):
+    if dist(lm, 4, 8, w, h) < 30:
+        return "CLICK"
+
+    iu = is_finger_up(lm, 8, 6)
+    mu = is_finger_up(lm, 12, 10)
+    ru = is_finger_up(lm, 16, 14)
+    pu = is_finger_up(lm, 20, 18)
+
+    if iu and mu and ru and pu:
+        return "FREEZE"
+    if iu and mu and not ru and not pu:
+        return "SHORTCUT"
+    if iu and not mu:
+        return "MOVE"
+    return "NONE"
+
 
 def result_callback(result, output_image, timestamp_ms):
     global latest_result
@@ -56,6 +87,7 @@ with vision.HandLandmarker.create_from_options(options) as landmarker:
         if latest_result and latest_result.hand_landmarks:
             for hand_landmarks in latest_result.hand_landmarks:
                 h, w, _ = frame.shape
+                gesture = classify(hand_landmarks, w, h)
                 points = []
                 for lm in hand_landmarks:
                     cx, cy = int(lm.x * w), int(lm.y * h)
@@ -66,6 +98,16 @@ with vision.HandLandmarker.create_from_options(options) as landmarker:
                 for start_idx, end_idx in HAND_CONNECTIONS:
                     if start_idx < len(points) and end_idx < len(points):
                         cv2.line(frame, points[start_idx], points[end_idx], (0, 255, 0), 2)
+
+                cv2.putText(
+                    frame,
+                    gesture,
+                    (10, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.2,
+                    (0, 220, 100),
+                    2,
+                )
 
         cv2.imshow("Hand Gesture Recognition", frame)
 
