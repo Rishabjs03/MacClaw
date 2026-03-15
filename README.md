@@ -1,4 +1,4 @@
-<h1 align="center">macClaw</h1>
+<h1 align="center">🦞 MacClaw 💻</h1>
 
 <p align="center">
   Control your Mac with hand gestures using a webcam, MediaPipe, and Python.
