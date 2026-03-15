@@ -3,6 +3,7 @@ import mediapipe as mp
 import math
 import pyautogui
 import time
+import Quartz
 
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -35,6 +36,7 @@ smooth_x, smooth_y = SCREEN_W / 2, SCREEN_H / 2
 last_click_time = 0.0
 last_scroll_y = None
 pinch_active = False
+drag_active = False
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0
 
@@ -102,6 +104,19 @@ def move_cursor(tx, ty):
     pyautogui.moveTo(int(smooth_x), int(smooth_y), duration=0)
 
 
+def drag_move(tx, ty):
+    global smooth_x, smooth_y
+    smooth_x += (tx - smooth_x) * SMOOTH
+    smooth_y += (ty - smooth_y) * SMOOTH
+    event = Quartz.CGEventCreateMouseEvent(
+        None,
+        Quartz.kCGEventLeftMouseDragged,
+        (smooth_x, smooth_y),
+        Quartz.kCGMouseButtonLeft,
+    )
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+
+
 def trigger_click():
     global last_click_time
     now = time.monotonic()
@@ -130,12 +145,15 @@ def scroll_page(lm):
 
 
 def reset_modes(gesture):
-    global last_scroll_y, pinch_active
+    global last_scroll_y, pinch_active, drag_active
 
     if gesture != "CLICK":
         pinch_active = False
     if gesture != "SCROLL":
         last_scroll_y = None
+    if gesture != "DRAG" and drag_active:
+        pyautogui.mouseUp()
+        drag_active = False
 
 
 def route_action(gesture, lm):
@@ -151,6 +169,43 @@ def route_action(gesture, lm):
         pass
 
 
+def get_hands(result):
+    left_lm, right_lm = None, None
+    if not result or not result.hand_landmarks:
+        return left_lm, right_lm
+    for i, handedness in enumerate(result.handedness):
+        label = handedness[0].category_name
+        if label == "Left":
+            right_lm = result.hand_landmarks[i]
+        else:
+            left_lm = result.hand_landmarks[i]
+    return left_lm, right_lm
+
+
+from collections import deque
+mode_buffer = deque(maxlen=8) 
+
+def stable_mode(raw_mode):
+    mode_buffer.append(raw_mode)
+    if mode_buffer.count(raw_mode) == len(mode_buffer):
+        return raw_mode
+    return max(set(mode_buffer), key=mode_buffer.count)
+
+
+def classify_mode(lm):
+    if lm is None:
+        return "IDLE"
+    iu = is_finger_up(lm, 8,  6)
+    mu = is_finger_up(lm, 12, 10)
+    ru = is_finger_up(lm, 16, 14)
+    pu = is_finger_up(lm, 20, 18)
+    if not iu and not mu and not ru and not pu:  return "IDLE"    
+    if iu and not mu and not ru and not pu:       return "CURSOR"  
+    if iu and mu and not ru and not pu:           return "SCROLL"  
+    if iu and mu and ru and not pu:              return "DRAG"    
+    return "IDLE"
+
+
 def result_callback(result, output_image, timestamp_ms):
     global latest_result
     latest_result = result
@@ -160,7 +215,7 @@ base_options = python.BaseOptions(model_asset_path='hand_landmarker.task')
 options = vision.HandLandmarkerOptions(
     base_options=base_options,
     running_mode=vision.RunningMode.LIVE_STREAM,
-    num_hands=1,
+    num_hands=2,
     min_hand_detection_confidence=0.7,
     min_tracking_confidence=0.5,
     result_callback=result_callback
@@ -185,37 +240,52 @@ with vision.HandLandmarker.create_from_options(options) as landmarker:
         timestamp_ms = int(time.time() * 1000)
         landmarker.detect_async(mp_image, timestamp_ms)
 
-        # Draw landmarks from latest result
+       
         if latest_result and latest_result.hand_landmarks:
-            for hand_landmarks in latest_result.hand_landmarks:
-                h, w, _ = frame.shape
-                gesture = classify(hand_landmarks, w, h)
-                route_action(gesture, hand_landmarks)
+            h, w, _ = frame.shape
 
-                box_start = (int(ACTIVE_X_MIN * w), int(ACTIVE_Y_MIN * h))
-                box_end = (int(ACTIVE_X_MAX * w), int(ACTIVE_Y_MAX * h))
+            
+            left_lm, right_lm = get_hands(latest_result)
+
+            
+            raw_mode     = classify_mode(left_lm)
+            current_mode = stable_mode(raw_mode)
+
+            
+            reset_modes(current_mode)
+
+            if right_lm is not None and current_mode != "IDLE":
+                if current_mode == "CURSOR":
+                    move_cursor(*to_screen(right_lm))
+                    if is_pinching(right_lm, w, h):
+                        trigger_click()
+                elif current_mode == "SCROLL":
+                    scroll_page(right_lm)
+                elif current_mode == "DRAG":
+                    if not drag_active:
+                        move_cursor(*to_screen(right_lm))
+                        pyautogui.mouseDown()
+                        drag_active = True
+                    else:
+                        drag_move(*to_screen(right_lm))
+
+           
+            for hand_landmarks in latest_result.hand_landmarks:
                 points = []
                 for lm in hand_landmarks:
                     cx, cy = int(lm.x * w), int(lm.y * h)
                     points.append((cx, cy))
                     cv2.circle(frame, (cx, cy), 5, (0, 255, 0), -1)
-
-                # Draw connections
                 for start_idx, end_idx in HAND_CONNECTIONS:
-                    if start_idx < len(points) and end_idx < len(points):
-                        cv2.line(frame, points[start_idx], points[end_idx], (0, 255, 0), 2)
+                    cv2.line(frame, points[start_idx], points[end_idx], (0, 255, 0), 2)
 
-                cv2.rectangle(frame, box_start, box_end, (255, 180, 0), 2)
+            
+            box_start = (int(ACTIVE_X_MIN * w), int(ACTIVE_Y_MIN * h))
+            box_end   = (int(ACTIVE_X_MAX * w), int(ACTIVE_Y_MAX * h))
+            cv2.rectangle(frame, box_start, box_end, (255, 180, 0), 2)
+            cv2.putText(frame, f"MODE: {current_mode}", (10, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 220, 100), 2)
 
-                cv2.putText(
-                    frame,
-                    gesture,
-                    (10, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1.2,
-                    (0, 220, 100),
-                    2,
-                )
         else:
             reset_modes("NONE")
 
